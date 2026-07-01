@@ -1,0 +1,183 @@
+version: "3.9"
+
+# Demo 01 — IO chaos injected into PostgreSQL via LD_PRELOAD
+# libchaos-io intercepts write(2) and fsync(2) and returns EIO at the
+# configured probability.  PostgreSQL is a perfect target because it
+# fsyncs every WAL buffer before committing a transaction.
+#
+# Config format (hot-reloaded, no restart needed):
+#   <path_prefix>:<syscall>:ERRNO:<errno_name>:<probability 0-1>
+#
+# Shared volumes:
+#   chaos-libs  — the pre-built .so files (downloaded from GitHub releases)
+#   chaos-conf  — plain-text config files written by chaos-probe
+
+volumes:
+  pgdata:
+  chaos-libs:
+  chaos-conf:
+
+networks:
+  pg-chaos:
+    driver: bridge
+
+services:
+
+  # ------------------------------------------------------------------ #
+  #  chaos-libs-init — downloads chaos .so from GitHub releases         #
+  # ------------------------------------------------------------------ #
+  chaos-libs-init:
+    image: alpine:3.19
+    container_name: chaos-libs-init
+    volumes:
+      - chaos-libs:/chaos/libs
+    environment:
+      CHAOS_LIBS_VERSION: ${CHAOS_LIBS_VERSION:-1.0.0}
+    command: >
+      sh -c "
+        apk add --no-cache wget &&
+        BASE=https://github.com/macstab/macstab-chaos-testing-libraries/releases/download &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-io-musl-amd64.so
+      "
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  chaos-probe — writes and hot-reloads the config file               #
+  # ------------------------------------------------------------------ #
+  chaos-probe:
+    image: alpine:3.19
+    container_name: chaos-probe
+    volumes:
+      - chaos-conf:/chaos
+    # Write the initial config and keep the file present.
+    # The app service reads this path at syscall time.
+    command: >
+      sh -c "
+        mkdir -p /chaos &&
+        cat > /chaos/.chaos-io.conf <<'EOF'
+/var/lib/postgresql/data:write:ERRNO:EIO:0.2
+/var/lib/postgresql/data:fsync:ERRNO:EIO:0.1
+EOF
+        echo '[chaos-probe] config written:' &&
+        cat /chaos/.chaos-io.conf &&
+        # Keep running so the config file persists on the shared volume
+        tail -f /dev/null
+      "
+    networks:
+      - pg-chaos
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  postgres — LD_PRELOAD injects IO chaos at the libc level           #
+  # ------------------------------------------------------------------ #
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-chaos
+    depends_on:
+      chaos-probe:
+        condition: service_started
+      chaos-libs-init:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: chaos
+      POSTGRES_PASSWORD: chaos
+      POSTGRES_DB: chaosdb
+      # Tell the dynamic linker to load our interception library before
+      # anything else.  All write() and fsync() calls from postgres will
+      # go through it.
+      LD_PRELOAD: /chaos/libs/libchaos-io-musl-amd64.so
+      # Config path read by the library at every intercepted syscall.
+      CHAOS_IO_CONF: /chaos/.chaos-io.conf
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - chaos-libs:/chaos/libs:ro
+      - chaos-conf:/chaos
+    networks:
+      - pg-chaos
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chaos -d chaosdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    # Postgres will log EIO errors to stderr — that is expected.
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  app — runs the INSERT workload and measures error rates            #
+  # ------------------------------------------------------------------ #
+  app:
+    image: alpine:3.19
+    container_name: chaos-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: chaos
+      PGPASSWORD: chaos
+      PGDATABASE: chaosdb
+    networks:
+      - pg-chaos
+    command: >
+      sh -c "
+        apk add --no-cache postgresql-client 2>/dev/null &&
+
+        echo '=== Creating test table ===' &&
+        psql -c 'DROP TABLE IF EXISTS chaos_test;
+                 CREATE TABLE chaos_test (
+                   id       SERIAL PRIMARY KEY,
+                   batch    INT NOT NULL,
+                   payload  TEXT NOT NULL,
+                   ts       TIMESTAMPTZ DEFAULT now()
+                 );' &&
+
+        echo '=== Running 10 batches of 100 INSERTs ===' &&
+
+        SUCCESSES=0
+        FAILURES=0
+
+        i=1
+        while [ \$i -le 10 ]; do
+          # Build a transaction with 100 INSERTs
+          SQL=\"BEGIN;\"
+          j=1
+          while [ \$j -le 100 ]; do
+            SQL=\"\${SQL} INSERT INTO chaos_test(batch, payload) VALUES(\$i, 'payload-\$i-\$j');\"
+            j=\$((j+1))
+          done
+          SQL=\"\${SQL} COMMIT;\"
+
+          if psql -c \"\$SQL\" 2>/dev/null; then
+            SUCCESSES=\$((SUCCESSES+1))
+            echo \"  batch \$i: OK\"
+          else
+            FAILURES=\$((FAILURES+1))
+            echo \"  batch \$i: FAILED (EIO injected)\"
+          fi
+          i=\$((i+1))
+        done
+
+        echo ''
+        echo '=== Results ==='
+        echo \"  Successful batches : \$SUCCESSES\"
+        echo \"  Failed batches     : \$FAILURES\"
+        echo ''
+
+        echo '=== Row count (only committed data) ==='
+        psql -c 'SELECT batch, COUNT(*) AS rows FROM chaos_test GROUP BY batch ORDER BY batch;'
+
+        echo ''
+        echo '=== Checksum verification (SHA256 of all payload values) ==='
+        psql -c \"SELECT md5(string_agg(payload, '' ORDER BY id)) AS payload_checksum FROM chaos_test;\"
+
+        echo ''
+        echo '=== pg_stat_bgwriter — fsync error count ==='
+        psql -c 'SELECT checkpoints_req, checkpoints_timed, buffers_checkpoint, buffers_clean, maxwritten_clean FROM pg_stat_bgwriter;'
+        psql -c 'SELECT datname, blks_read, blks_hit FROM pg_stat_database WHERE datname = current_database();'
+
+        echo ''
+        echo '=== Demo complete. ==='
+      "
+    restart: "no"

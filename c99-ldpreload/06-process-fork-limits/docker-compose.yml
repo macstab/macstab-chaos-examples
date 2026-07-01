@@ -1,0 +1,132 @@
+version: "3.9"
+
+# Demo 06 — Process chaos: fork() EAGAIN after N successful forks
+#
+# libchaos-process intercepts fork(2) / clone(2) and can be configured
+# to fail after a fixed number of successful calls.
+#
+# Config format:
+#   fork:FAIL_AFTER:<errno_name>,<count>
+#
+# Effect on gunicorn:
+#   - gunicorn pre-forks worker processes at startup and respawns them
+#     on death.
+#   - After 10 successful forks, every subsequent fork() returns EAGAIN.
+#   - gunicorn logs "worker failed to boot" and the monitor script
+#     detects the drop in live worker count.
+#
+# This demo shows how a supervisor must handle fork exhaustion gracefully
+# rather than crashing the master process.
+
+volumes:
+  chaos-libs:
+  chaos-conf:
+
+networks:
+  fork-chaos:
+    driver: bridge
+
+services:
+
+  # ------------------------------------------------------------------ #
+  #  chaos-libs-init — downloads chaos .so from GitHub releases         #
+  # ------------------------------------------------------------------ #
+  chaos-libs-init:
+    image: alpine:3.19
+    container_name: chaos-libs-init
+    volumes:
+      - chaos-libs:/chaos/libs
+    environment:
+      CHAOS_LIBS_VERSION: ${CHAOS_LIBS_VERSION:-1.0.0}
+    command: >
+      sh -c "
+        apk add --no-cache wget &&
+        BASE=https://github.com/macstab/macstab-chaos-testing-libraries/releases/download &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-process-glibc-amd64.so
+      "
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  chaos-fork-writer — writes the process chaos config                #
+  # ------------------------------------------------------------------ #
+  chaos-fork-writer:
+    image: alpine:3.19
+    container_name: chaos-fork-writer
+    volumes:
+      - chaos-conf:/chaos
+    command: >
+      sh -c "
+        mkdir -p /chaos &&
+        cat > /chaos/.chaos-process.conf <<'EOF'
+fork:FAIL_AFTER:EAGAIN,10
+EOF
+        echo '[chaos-fork-writer] config:' &&
+        cat /chaos/.chaos-process.conf &&
+        tail -f /dev/null
+      "
+    networks:
+      - fork-chaos
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  gunicorn — WSGI server with LD_PRELOAD fork chaos                  #
+  # ------------------------------------------------------------------ #
+  gunicorn:
+    image: python:3.12-slim
+    container_name: chaos-gunicorn
+    depends_on:
+      chaos-fork-writer:
+        condition: service_started
+      chaos-libs-init:
+        condition: service_completed_successfully
+    environment:
+      LD_PRELOAD: /chaos/libs/libchaos-process-glibc-amd64.so
+      CHAOS_PROCESS_CONF: /chaos/.chaos-process.conf
+    volumes:
+      - chaos-libs:/chaos/libs:ro
+      - chaos-conf:/chaos
+      - ./wsgi_app.py:/app/wsgi_app.py:ro
+    working_dir: /app
+    command: >
+      sh -c "
+        pip install gunicorn --quiet &&
+        # 4 workers: the first 10 forks (pre-fork + respawn attempts) succeed,
+        # then fork() starts returning EAGAIN.
+        gunicorn \
+          --workers 4 \
+          --bind 0.0.0.0:8000 \
+          --timeout 30 \
+          --graceful-timeout 5 \
+          --log-level debug \
+          --access-logfile - \
+          --error-logfile - \
+          wsgi_app:application
+      "
+    networks:
+      - fork-chaos
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  monitor — watches gunicorn worker count and alerts on drops        #
+  # ------------------------------------------------------------------ #
+  monitor:
+    image: python:3.12-slim
+    container_name: chaos-fork-monitor
+    depends_on:
+      gunicorn:
+        condition: service_healthy
+    volumes:
+      - ./monitor.py:/app/monitor.py:ro
+    working_dir: /app
+    command: >
+      sh -c "python monitor.py"
+    network_mode: "service:gunicorn"
+    restart: "no"

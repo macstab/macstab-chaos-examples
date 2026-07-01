@@ -1,0 +1,8 @@
+CREATE TABLE IF NOT EXISTS users (
+    id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name VARCHAR(255) NOT NULL
+);
+
+INSERT INTO users (name) VALUES ('alice');
+INSERT INTO users (name) VALUES ('bob');
+INSERT INTO users (name) VALUES ('carol');

@@ -1,0 +1,117 @@
+version: "3.9"
+
+# Demo 03 — DNS chaos on service-discovery hostname resolution
+#
+# libchaos-dns intercepts getaddrinfo(3) and can inject:
+#   EAI_AGAIN  — transient resolver failure (simulate flapping DNS)
+#   LATENCY    — adds artificial delay to DNS resolution
+#
+# Config format:
+#   dns://<hostname>:<fault>:<value>:<probability>
+#
+# The app calls the downstream service by hostname every time
+# (no IP caching), so every request triggers a DNS resolution.
+# 30 % of resolutions fail with EAI_AGAIN, 20 % are slowed by 500 ms.
+
+volumes:
+  chaos-libs:
+  chaos-conf:
+
+networks:
+  dns-chaos:
+    driver: bridge
+
+services:
+
+  # ------------------------------------------------------------------ #
+  #  chaos-libs-init — downloads chaos .so from GitHub releases         #
+  # ------------------------------------------------------------------ #
+  chaos-libs-init:
+    image: alpine:3.19
+    container_name: chaos-libs-init
+    volumes:
+      - chaos-libs:/chaos/libs
+    environment:
+      CHAOS_LIBS_VERSION: ${CHAOS_LIBS_VERSION:-1.0.0}
+    command: >
+      sh -c "
+        apk add --no-cache wget &&
+        BASE=https://github.com/macstab/macstab-chaos-testing-libraries/releases/download &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-dns-musl-amd64.so
+      "
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  downstream — WireMock stubbed HTTP service                         #
+  # ------------------------------------------------------------------ #
+  downstream:
+    image: wiremock/wiremock:latest
+    container_name: downstream
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./wiremock/mappings:/home/wiremock/mappings:ro
+    networks:
+      - dns-chaos
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/__admin/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  chaos-dns-writer — writes the DNS chaos config                     #
+  # ------------------------------------------------------------------ #
+  chaos-dns-writer:
+    image: alpine:3.19
+    container_name: chaos-dns-writer
+    volumes:
+      - chaos-conf:/chaos
+    command: >
+      sh -c "
+        mkdir -p /chaos &&
+        cat > /chaos/.chaos-dns.conf <<'EOF'
+dns://downstream:EAI_AGAIN:0.30
+dns://downstream:LATENCY:500:0.20
+EOF
+        echo '[chaos-dns-writer] config:' &&
+        cat /chaos/.chaos-dns.conf &&
+        tail -f /dev/null
+      "
+    networks:
+      - dns-chaos
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  app — Python HTTP client with LD_PRELOAD DNS chaos                 #
+  # ------------------------------------------------------------------ #
+  app:
+    image: python:3.12-slim
+    container_name: chaos-dns-app
+    depends_on:
+      downstream:
+        condition: service_healthy
+      chaos-dns-writer:
+        condition: service_started
+      chaos-libs-init:
+        condition: service_completed_successfully
+    environment:
+      DOWNSTREAM_HOST: downstream
+      DOWNSTREAM_PORT: "8080"
+      LD_PRELOAD: /chaos/libs/libchaos-dns-musl-amd64.so
+      CHAOS_DNS_CONF: /chaos/.chaos-dns.conf
+    volumes:
+      - chaos-libs:/chaos/libs:ro
+      - chaos-conf:/chaos
+      - ./app.py:/app/app.py:ro
+    working_dir: /app
+    command: >
+      sh -c "
+        pip install requests --quiet &&
+        python app.py
+      "
+    networks:
+      - dns-chaos
+    restart: "no"

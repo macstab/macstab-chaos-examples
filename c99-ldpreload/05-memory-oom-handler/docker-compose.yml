@@ -1,0 +1,97 @@
+version: "3.9"
+
+# Demo 05 — Memory chaos: 1% mmap ENOMEM on a Java DirectBuffer app
+#
+# libchaos-memory intercepts mmap(2) / mmap64(2) and returns ENOMEM at
+# the configured probability.  The JVM maps anonymous memory for direct
+# (off-heap) ByteBuffers via mmap MAP_ANONYMOUS.
+#
+# Config format:
+#   mmap/<mapping_type>:ERRNO:<errno_name>:<probability>
+#
+# At 1% ENOMEM the Java app will receive OutOfMemoryError from
+# ByteBuffer.allocateDirect() approximately once per 100 allocations.
+# The app catches each OOM, increments a counter, and continues —
+# demonstrating that a well-written application can survive sporadic
+# memory allocation failures.
+
+volumes:
+  chaos-libs:
+  chaos-conf:
+  java-src:
+
+networks:
+  mem-chaos:
+    driver: bridge
+
+services:
+
+  # ------------------------------------------------------------------ #
+  #  chaos-libs-init — downloads chaos .so from GitHub releases         #
+  # ------------------------------------------------------------------ #
+  chaos-libs-init:
+    image: alpine:3.19
+    container_name: chaos-libs-init
+    volumes:
+      - chaos-libs:/chaos/libs
+    environment:
+      CHAOS_LIBS_VERSION: ${CHAOS_LIBS_VERSION:-1.0.0}
+    command: >
+      sh -c "
+        apk add --no-cache wget &&
+        BASE=https://github.com/macstab/macstab-chaos-testing-libraries/releases/download &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-memory-glibc-amd64.so
+      "
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  chaos-mem-writer — writes the memory chaos config                  #
+  # ------------------------------------------------------------------ #
+  chaos-mem-writer:
+    image: alpine:3.19
+    container_name: chaos-mem-writer
+    volumes:
+      - chaos-conf:/chaos
+    command: >
+      sh -c "
+        mkdir -p /chaos &&
+        cat > /chaos/.chaos-memory.conf <<'EOF'
+mmap/anon:ERRNO:ENOMEM:0.01
+EOF
+        echo '[chaos-mem-writer] config:' &&
+        cat /chaos/.chaos-memory.conf &&
+        tail -f /dev/null
+      "
+    networks:
+      - mem-chaos
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  app — OpenJDK 21 with LD_PRELOAD memory chaos                      #
+  # ------------------------------------------------------------------ #
+  app:
+    image: openjdk:21-slim
+    container_name: chaos-jvm-app
+    depends_on:
+      chaos-mem-writer:
+        condition: service_started
+      chaos-libs-init:
+        condition: service_completed_successfully
+    environment:
+      LD_PRELOAD: /chaos/libs/libchaos-memory-glibc-amd64.so
+      CHAOS_MEMORY_CONF: /chaos/.chaos-memory.conf
+    volumes:
+      - chaos-libs:/chaos/libs:ro
+      - chaos-conf:/chaos
+      - ./DirectBufferChaos.java:/app/DirectBufferChaos.java:ro
+    working_dir: /app
+    command: >
+      sh -c "
+        echo 'Compiling DirectBufferChaos.java ...' &&
+        javac DirectBufferChaos.java &&
+        echo 'Running with LD_PRELOAD=libchaos-memory-glibc-amd64.so ...' &&
+        java -Xmx256m DirectBufferChaos
+      "
+    networks:
+      - mem-chaos
+    restart: "no"

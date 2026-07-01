@@ -1,0 +1,210 @@
+---
+# ServiceAccount and RBAC so the chaos job can read pod lists and exec curl into pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chaos-rst-job
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: chaos-rst-job
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chaos-rst-job
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: chaos-rst-job
+    namespace: default
+roleRef:
+  kind: Role
+  name: chaos-rst-job
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# The Job activates a 30% ECONNRESET (TCP RST) fault on every running pod of
+# sb3-jdbc-pool-deadlock via the chaos actuator endpoint, then monitors the
+# Deployment rollout, then deactivates the fault once the rollout is complete.
+#
+# What this proves:
+#   Upstream clients that retry on connection reset (e.g. HttpClient with retry=3)
+#   must see zero successful-request drops during the rolling update, even though
+#   30% of new connections receive a TCP RST.
+#
+# How to run:
+#   kubectl apply -f 03-rolling-update-rst-chaos-job.yaml
+#   kubectl logs -f job/rolling-update-rst-chaos
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rolling-update-rst-chaos
+  namespace: default
+  labels:
+    chaos-scenario: rolling-update-rst
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        chaos-scenario: rolling-update-rst
+    spec:
+      serviceAccountName: chaos-rst-job
+      restartPolicy: Never
+      containers:
+        - name: chaos-driver
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              DEPLOYMENT="sb3-jdbc-pool-deadlock"
+              NAMESPACE="default"
+              ACTUATOR_PORT="8080"
+
+              RST_SCENARIO='{
+                "id": "rolling-rst",
+                "selector": { "operation": "SOCKET_CONNECT" },
+                "effect": {
+                  "type": "REJECT",
+                  "message": "chaos: TCP RST during rolling update"
+                },
+                "probability": 0.30,
+                "enabled": true
+              }'
+
+              activate_chaos_on_pod() {
+                local POD_IP="$1"
+                local POD_NAME="$2"
+                echo "[chaos] Activating 30% RST on pod $POD_NAME ($POD_IP)"
+                curl -sf \
+                  -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "$RST_SCENARIO" \
+                  "http://${POD_IP}:${ACTUATOR_PORT}/actuator/chaos/scenarios" \
+                  && echo "[chaos] Activated on $POD_NAME" \
+                  || echo "[chaos] WARN: Could not activate on $POD_NAME (may be terminating)"
+              }
+
+              deactivate_chaos_on_pod() {
+                local POD_IP="$1"
+                local POD_NAME="$2"
+                echo "[chaos] Deactivating RST on pod $POD_NAME ($POD_IP)"
+                curl -sf \
+                  -X DELETE \
+                  "http://${POD_IP}:${ACTUATOR_PORT}/actuator/chaos/scenarios/rolling-rst" \
+                  && echo "[chaos] Deactivated on $POD_NAME" \
+                  || echo "[chaos] WARN: Could not deactivate on $POD_NAME (may be gone)"
+              }
+
+              echo "=== Rolling-update RST chaos scenario ==="
+              echo "Deployment: $DEPLOYMENT in namespace $NAMESPACE"
+              echo ""
+
+              # 1. Enumerate current ready pods and activate chaos on each
+              echo "--- Step 1: Activate RST chaos on all ready pods ---"
+              PODS=$(kubectl get pods -n "$NAMESPACE" \
+                -l "app=$DEPLOYMENT" \
+                --field-selector=status.phase=Running \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.podIP}{"\n"}{end}')
+
+              if [ -z "$PODS" ]; then
+                echo "ERROR: No running pods found for deployment $DEPLOYMENT"
+                exit 1
+              fi
+
+              declare -A POD_IPS
+              while IFS=$'\t' read -r POD_NAME POD_IP; do
+                [ -z "$POD_NAME" ] && continue
+                POD_IPS["$POD_NAME"]="$POD_IP"
+                activate_chaos_on_pod "$POD_IP" "$POD_NAME"
+              done <<< "$PODS"
+
+              echo ""
+              echo "--- Step 2: Trigger rolling update ---"
+              # Patch a label to force a rollout without changing the actual app image
+              kubectl patch deployment "$DEPLOYMENT" -n "$NAMESPACE" \
+                -p "{\"spec\":{\"template\":{\"metadata\":{\"labels\":{\"chaos-roll\":\"$(date +%s)\"}}}}}"
+
+              echo ""
+              echo "--- Step 3: Monitor rollout, activating chaos on new pods as they appear ---"
+              SEEN_PODS=()
+              for POD_NAME in "${!POD_IPS[@]}"; do
+                SEEN_PODS+=("$POD_NAME")
+              done
+
+              ROLLOUT_TIMEOUT=300
+              ELAPSED=0
+              ROLLOUT_COMPLETE=false
+
+              while [ $ELAPSED -lt $ROLLOUT_TIMEOUT ]; do
+                # Check if rollout finished
+                AVAILABLE=$(kubectl get deployment "$DEPLOYMENT" -n "$NAMESPACE" \
+                  -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0")
+                DESIRED=$(kubectl get deployment "$DEPLOYMENT" -n "$NAMESPACE" \
+                  -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+                UPDATED=$(kubectl get deployment "$DEPLOYMENT" -n "$NAMESPACE" \
+                  -o jsonpath='{.status.updatedReplicas}' 2>/dev/null || echo "0")
+
+                echo "[rollout] available=$AVAILABLE desired=$DESIRED updated=$UPDATED elapsed=${ELAPSED}s"
+
+                if [ "$AVAILABLE" = "$DESIRED" ] && [ "$UPDATED" = "$DESIRED" ] && [ "$DESIRED" != "0" ]; then
+                  ROLLOUT_COMPLETE=true
+                  break
+                fi
+
+                # Activate chaos on any newly started pods
+                CURRENT_PODS=$(kubectl get pods -n "$NAMESPACE" \
+                  -l "app=$DEPLOYMENT" \
+                  --field-selector=status.phase=Running \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.podIP}{"\n"}{end}')
+
+                while IFS=$'\t' read -r POD_NAME POD_IP; do
+                  [ -z "$POD_NAME" ] && continue
+                  if [[ ! " ${SEEN_PODS[*]} " =~ " ${POD_NAME} " ]]; then
+                    SEEN_PODS+=("$POD_NAME")
+                    POD_IPS["$POD_NAME"]="$POD_IP"
+                    activate_chaos_on_pod "$POD_IP" "$POD_NAME"
+                  fi
+                done <<< "$CURRENT_PODS"
+
+                sleep 10
+                ELAPSED=$((ELAPSED + 10))
+              done
+
+              echo ""
+              if [ "$ROLLOUT_COMPLETE" = "true" ]; then
+                echo "--- Step 4: Rolling update complete — deactivating chaos ---"
+                FINAL_PODS=$(kubectl get pods -n "$NAMESPACE" \
+                  -l "app=$DEPLOYMENT" \
+                  --field-selector=status.phase=Running \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.podIP}{"\n"}{end}')
+
+                while IFS=$'\t' read -r POD_NAME POD_IP; do
+                  [ -z "$POD_NAME" ] && continue
+                  deactivate_chaos_on_pod "$POD_IP" "$POD_NAME"
+                done <<< "$FINAL_PODS"
+
+                echo ""
+                echo "=== RESULT: Rolling update completed with 30% RST active ==="
+                echo "All pods are healthy and chaos has been deactivated."
+                echo "Verify zero request drops in your load test dashboard."
+              else
+                echo "=== RESULT: Rollout timed out after ${ROLLOUT_TIMEOUT}s ==="
+                exit 1
+              fi

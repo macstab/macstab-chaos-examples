@@ -1,0 +1,215 @@
+version: "3.9"
+
+# Demo 07 — ALL 6 chaos libraries simultaneously on a Flask application
+#
+# This is the unique selling point of the LD_PRELOAD approach: you can
+# compose multiple interception libraries into a single process without
+# modifying the application or its dependencies.
+#
+# Libraries loaded (colon-separated LD_PRELOAD):
+#   libchaos-io.so       — 5%  EIO on /tmp writes
+#   libchaos-net.so      — 10% EAGAIN on recv from upstream
+#   libchaos-dns.so      — 15% EAI_AGAIN on DNS resolution
+#   libchaos-time.so     — +100ms clock offset (monotonic stays clean)
+#   libchaos-memory.so   — 0.5% ENOMEM on anonymous mmap
+#   libchaos-process.so  — EAGAIN after 50 forks
+#
+# Services:
+#   flask    — the application under test (all 6 libs injected)
+#   redis    — session / counter store (no chaos — tests NET lib)
+#   downstream — WireMock HTTP stub (no chaos — tests DNS+NET libs)
+#   loadgen  — generates 10 req/s and prints live error-rate metrics
+
+volumes:
+  chaos-libs:
+  chaos-conf:
+
+networks:
+  fullstack-chaos:
+    driver: bridge
+
+services:
+
+  # ------------------------------------------------------------------ #
+  #  chaos-libs-init — downloads all 6 chaos .so from GitHub releases   #
+  # ------------------------------------------------------------------ #
+  chaos-libs-init:
+    image: alpine:3.19
+    container_name: chaos-libs-init
+    volumes:
+      - chaos-libs:/chaos/libs
+    environment:
+      CHAOS_LIBS_VERSION: ${CHAOS_LIBS_VERSION:-1.0.0}
+    command: >
+      sh -c "
+        apk add --no-cache wget &&
+        BASE=https://github.com/macstab/macstab-chaos-testing-libraries/releases/download &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-io-musl-amd64.so &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-net-musl-amd64.so &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-dns-musl-amd64.so &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-time-musl-amd64.so &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-memory-musl-amd64.so &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-process-musl-amd64.so
+      "
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  chaos-config-writer — writes all 6 config files                   #
+  # ------------------------------------------------------------------ #
+  chaos-config-writer:
+    image: alpine:3.19
+    container_name: chaos-config-writer
+    volumes:
+      - chaos-conf:/chaos
+    command: >
+      sh -c "
+        mkdir -p /chaos &&
+
+        cat > /chaos/.chaos-io.conf <<'EOF'
+/tmp:write:ERRNO:EIO:0.05
+EOF
+
+        cat > /chaos/.chaos-net.conf <<'EOF'
+tcp4://upstream:8080:recv:ERRNO:EAGAIN:0.10
+EOF
+
+        cat > /chaos/.chaos-dns.conf <<'EOF'
+dns://downstream:EAI_AGAIN:0.15
+EOF
+
+        cat > /chaos/.chaos-time.conf <<'EOF'
+clock_gettime/realtime:OFFSET:100
+EOF
+
+        cat > /chaos/.chaos-memory.conf <<'EOF'
+mmap/anon:ERRNO:ENOMEM:0.005
+EOF
+
+        cat > /chaos/.chaos-process.conf <<'EOF'
+fork:FAIL_AFTER:EAGAIN,50
+EOF
+
+        echo '[config-writer] All 6 configs written:'
+        for f in /chaos/.chaos-*.conf; do
+          echo \"  \$f:\"; cat \"\$f\"
+        done
+        tail -f /dev/null
+      "
+    networks:
+      - fullstack-chaos
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  redis — session / counter store                                    #
+  # ------------------------------------------------------------------ #
+  redis:
+    image: redis:7.4-alpine
+    container_name: chaos-redis-fs
+    networks:
+      - fullstack-chaos
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  downstream — WireMock HTTP stub (upstream API)                     #
+  # ------------------------------------------------------------------ #
+  downstream:
+    image: wiremock/wiremock:latest
+    container_name: chaos-downstream-fs
+    volumes:
+      - ../03-dns-service-discovery-flap/wiremock/mappings:/home/wiremock/mappings:ro
+    networks:
+      - fullstack-chaos
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/__admin/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  flask — the application under test (all 6 libs)                   #
+  # ------------------------------------------------------------------ #
+  flask:
+    image: python:3.12-slim
+    container_name: chaos-flask-fs
+    depends_on:
+      redis:
+        condition: service_healthy
+      downstream:
+        condition: service_healthy
+      chaos-config-writer:
+        condition: service_started
+      chaos-libs-init:
+        condition: service_completed_successfully
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DOWNSTREAM_HOST: downstream
+      DOWNSTREAM_PORT: "8080"
+      FLASK_ENV: production
+      # All 6 libraries, colon-separated — this is the unique capability
+      LD_PRELOAD: >-
+        /chaos/libs/libchaos-io-musl-amd64.so:/chaos/libs/libchaos-net-musl-amd64.so:/chaos/libs/libchaos-dns-musl-amd64.so:/chaos/libs/libchaos-time-musl-amd64.so:/chaos/libs/libchaos-memory-musl-amd64.so:/chaos/libs/libchaos-process-musl-amd64.so
+      CHAOS_IO_CONF:      /chaos/.chaos-io.conf
+      CHAOS_NET_CONF:     /chaos/.chaos-net.conf
+      CHAOS_DNS_CONF:     /chaos/.chaos-dns.conf
+      CHAOS_TIME_CONF:    /chaos/.chaos-time.conf
+      CHAOS_MEMORY_CONF:  /chaos/.chaos-memory.conf
+      CHAOS_PROCESS_CONF: /chaos/.chaos-process.conf
+    volumes:
+      - chaos-libs:/chaos/libs:ro
+      - chaos-conf:/chaos
+      - ./flask_app.py:/app/flask_app.py:ro
+    working_dir: /app
+    command: >
+      sh -c "
+        pip install flask redis requests gunicorn --quiet &&
+        gunicorn \
+          --workers 2 \
+          --bind 0.0.0.0:5000 \
+          --timeout 30 \
+          --log-level info \
+          --access-logfile - \
+          flask_app:app
+      "
+    networks:
+      - fullstack-chaos
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      interval: 5s
+      timeout: 4s
+      retries: 10
+      start_period: 20s
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  loadgen — hits Flask at 10 req/s and prints live metrics           #
+  # ------------------------------------------------------------------ #
+  loadgen:
+    image: python:3.12-slim
+    container_name: chaos-loadgen-fs
+    depends_on:
+      flask:
+        condition: service_healthy
+    volumes:
+      - ./loadgen.py:/app/loadgen.py:ro
+    working_dir: /app
+    command: >
+      sh -c "
+        pip install requests --quiet &&
+        python loadgen.py
+      "
+    environment:
+      FLASK_URL: http://flask:5000
+    networks:
+      - fullstack-chaos
+    restart: "no"

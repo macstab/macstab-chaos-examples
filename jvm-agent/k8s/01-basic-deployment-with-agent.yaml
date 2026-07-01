@@ -1,0 +1,134 @@
+---
+# ConfigMap holding the chaos plan consumed by the agent at startup and watched for live changes.
+# The agent reloads plan.json whenever the file changes (watchConfigFile=true), so you can
+# update this ConfigMap and apply it without restarting the pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chaos-plan
+  namespace: default
+  labels:
+    app: sb3-jdbc-pool-deadlock
+data:
+  plan.json: |
+    {
+      "scenarios": [
+        {
+          "id": "socket-latency",
+          "selector": {
+            "operation": "SOCKET_CONNECT"
+          },
+          "effect": {
+            "type": "DELAY",
+            "delayMs": 100
+          },
+          "probability": 0.50,
+          "enabled": true
+        },
+        {
+          "id": "executor-reject",
+          "selector": {
+            "operation": "EXECUTOR_SUBMIT"
+          },
+          "effect": {
+            "type": "REJECT",
+            "message": "chaos: executor submit rejected"
+          },
+          "probability": 0.05,
+          "enabled": true
+        }
+      ]
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sb3-jdbc-pool-deadlock
+  namespace: default
+  labels:
+    app: sb3-jdbc-pool-deadlock
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sb3-jdbc-pool-deadlock
+  template:
+    metadata:
+      labels:
+        app: sb3-jdbc-pool-deadlock
+    spec:
+      initContainers:
+        # Copies the chaos agent jar from a dedicated sidecar image into a shared emptyDir
+        # volume so the app container can reference it in JAVA_TOOL_OPTIONS.
+        - name: chaos-agent-installer
+          image: ghcr.io/macstab/chaos-agent-bootstrap:latest
+          command: ["cp", "/agent/chaos-agent-bootstrap.jar", "/chaos/chaos-agent-bootstrap.jar"]
+          volumeMounts:
+            - name: chaos-agent-volume
+              mountPath: /chaos
+
+      containers:
+        - name: app
+          image: ghcr.io/macstab/sb3-jdbc-pool-deadlock:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: JAVA_TOOL_OPTIONS
+              value: >-
+                -javaagent:/chaos/chaos-agent-bootstrap.jar=configFile=/chaos-plan/plan.json;watchConfigFile=true
+            - name: SPRING_PROFILES_ACTIVE
+              value: kubernetes
+          volumeMounts:
+            - name: chaos-agent-volume
+              mountPath: /chaos
+              readOnly: true
+            - name: chaos-plan-volume
+              mountPath: /chaos-plan
+              readOnly: true
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            # /actuator/chaos returns 200 when the agent is active and accepting traffic.
+            # The pod is only added to the Service endpoints once the agent is ready.
+            httpGet:
+              path: /actuator/chaos
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 3
+
+      volumes:
+        - name: chaos-agent-volume
+          emptyDir: {}
+        - name: chaos-plan-volume
+          configMap:
+            name: chaos-plan
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sb3-jdbc-pool-deadlock
+  namespace: default
+spec:
+  selector:
+    app: sb3-jdbc-pool-deadlock
+  ports:
+    - port: 80
+      targetPort: 8080
+      name: http

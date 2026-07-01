@@ -1,0 +1,168 @@
+---
+# ConfigMap: chaos plan that injects MonitorContention stressor (8 background lock contenders).
+# Virtual threads that block on a synchronized method or block pin their carrier thread.
+# This stressor makes carrier pinning happen frequently and measurably.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chaos-plan-vthread-pinning
+  namespace: default
+  labels:
+    app: sb4-impossible
+data:
+  plan.json: |
+    {
+      "version": "1.0",
+      "scenarios": [
+        {
+          "id": "monitor-contention",
+          "description": "8 background threads contend on shared monitors, causing virtual thread carrier pinning",
+          "selector": {
+            "stressor": "MONITOR_CONTENTION"
+          },
+          "effect": {
+            "type": "MONITOR_CONTENTION",
+            "contenderCount": 8
+          },
+          "enabled": true
+        }
+      ]
+    }
+
+---
+# Deployment for the Spring Boot 4 virtual-thread pinning demo.
+# Virtual threads are enabled via spring.threads.virtual.enabled=true and
+# --enable-preview is passed to the JVM to opt into preview APIs on Java 21.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sb4-impossible
+  namespace: default
+  labels:
+    app: sb4-impossible
+  annotations:
+    description: "Spring Boot 4 virtual thread pinning demo with chaos agent MonitorContention stressor"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sb4-impossible
+  template:
+    metadata:
+      labels:
+        app: sb4-impossible
+      annotations:
+        # Prometheus scrape annotations — chaos_virtual_thread_pinning_count is exposed here
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      initContainers:
+        - name: chaos-agent-installer
+          image: ghcr.io/macstab/chaos-agent-bootstrap:latest
+          command: ["cp", "/agent/chaos-agent-bootstrap.jar", "/chaos/chaos-agent-bootstrap.jar"]
+          volumeMounts:
+            - name: chaos-agent-volume
+              mountPath: /chaos
+
+      containers:
+        - name: app
+          image: ghcr.io/macstab/sb4-impossible:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: JAVA_TOOL_OPTIONS
+              value: >-
+                --enable-preview
+                -javaagent:/chaos/chaos-agent-bootstrap.jar=configFile=/chaos-plan/plan.json;watchConfigFile=true
+                -Djdk.tracePinnedThreads=full
+            - name: SPRING_THREADS_VIRTUAL_ENABLED
+              value: "true"
+          volumeMounts:
+            - name: chaos-agent-volume
+              mountPath: /chaos
+              readOnly: true
+            - name: chaos-plan-volume
+              mountPath: /chaos-plan
+              readOnly: true
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "2000m"
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 3
+
+      volumes:
+        - name: chaos-agent-volume
+          emptyDir: {}
+        - name: chaos-plan-volume
+          configMap:
+            name: chaos-plan-vthread-pinning
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sb4-impossible
+  namespace: default
+  labels:
+    app: sb4-impossible
+spec:
+  selector:
+    app: sb4-impossible
+  ports:
+    - port: 80
+      targetPort: 8080
+      name: http
+
+---
+# HPA backed by the custom metric chaos_virtual_thread_pinning_count.
+# The metric is exported by the chaos agent at /actuator/prometheus and scraped
+# by Prometheus.  KEDA's prometheus scaler surfaces it as an ExternalMetric so
+# HPA can scale on it directly.
+#
+# Scaling logic: if the average pinning count per pod exceeds 100, add replicas.
+# More replicas = fewer virtual threads per pod = less contention per carrier.
+#
+# Prerequisites:
+#   kubectl apply -f https://github.com/kedacore/keda/releases/download/v2.15.1/keda-2.15.1.yaml
+#   Prometheus configured to scrape pod annotations above.
+#   KEDA PrometheusScaler pointing at your Prometheus endpoint.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: sb4-impossible-vthread-pinning-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: sb4-impossible
+  minReplicaCount: 2
+  maxReplicaCount: 10
+  cooldownPeriod: 60
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+        metricName: chaos_virtual_thread_pinning_count
+        query: >
+          sum(rate(chaos_virtual_thread_pinning_count{app="sb4-impossible"}[1m]))
+          /
+          count(up{app="sb4-impossible"})
+        threshold: "100"

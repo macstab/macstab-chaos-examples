@@ -1,0 +1,115 @@
+version: "3.9"
+
+# Demo 04 — Clock-drift chaos on a distributed lock implementation
+#
+# libchaos-time intercepts clock_gettime(2) and offsets CLOCK_REALTIME
+# by a configurable number of milliseconds.
+#
+# Config format:
+#   clock_gettime/<clock_id>:OFFSET:<milliseconds>
+#
+# Effect on a SETNX-based distributed lock:
+#   - The lock holder checks `time.time()` to know if its own lock TTL
+#     has expired before releasing.
+#   - With +5000 ms drift the holder believes it is 5 seconds in the
+#     future; it sees the lock as expired BEFORE Redis actually expires
+#     it, causing "split-brain" events where a second holder acquires
+#     the lock while the first still believes it holds it.
+
+volumes:
+  chaos-libs:
+  chaos-conf:
+
+networks:
+  time-chaos:
+    driver: bridge
+
+services:
+
+  # ------------------------------------------------------------------ #
+  #  chaos-libs-init — downloads chaos .so from GitHub releases         #
+  # ------------------------------------------------------------------ #
+  chaos-libs-init:
+    image: alpine:3.19
+    container_name: chaos-libs-init
+    volumes:
+      - chaos-libs:/chaos/libs
+    environment:
+      CHAOS_LIBS_VERSION: ${CHAOS_LIBS_VERSION:-1.0.0}
+    command: >
+      sh -c "
+        apk add --no-cache wget &&
+        BASE=https://github.com/macstab/macstab-chaos-testing-libraries/releases/download &&
+        wget -q -P /chaos/libs \$BASE/\$CHAOS_LIBS_VERSION/libchaos-time-musl-amd64.so
+      "
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  redis — the lock backend                                           #
+  # ------------------------------------------------------------------ #
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis-lock
+    networks:
+      - time-chaos
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  chaos-time-writer — writes the time chaos config                  #
+  # ------------------------------------------------------------------ #
+  chaos-time-writer:
+    image: alpine:3.19
+    container_name: chaos-time-writer
+    volumes:
+      - chaos-conf:/chaos
+    command: >
+      sh -c "
+        mkdir -p /chaos &&
+        cat > /chaos/.chaos-time.conf <<'EOF'
+clock_gettime/realtime:OFFSET:5000
+EOF
+        echo '[chaos-time-writer] config:' &&
+        cat /chaos/.chaos-time.conf &&
+        tail -f /dev/null
+      "
+    networks:
+      - time-chaos
+    restart: "no"
+
+  # ------------------------------------------------------------------ #
+  #  app — Python distributed lock demo with clock-drift detection      #
+  # ------------------------------------------------------------------ #
+  app:
+    image: python:3.12-slim
+    container_name: chaos-time-app
+    depends_on:
+      redis:
+        condition: service_healthy
+      chaos-time-writer:
+        condition: service_started
+      chaos-libs-init:
+        condition: service_completed_successfully
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      LD_PRELOAD: /chaos/libs/libchaos-time-musl-amd64.so
+      CHAOS_TIME_CONF: /chaos/.chaos-time.conf
+    volumes:
+      - chaos-libs:/chaos/libs:ro
+      - chaos-conf:/chaos
+      - ./app.py:/app/app.py:ro
+    working_dir: /app
+    command: >
+      sh -c "
+        pip install redis --quiet &&
+        python app.py
+      "
+    networks:
+      - time-chaos
+    restart: "no"

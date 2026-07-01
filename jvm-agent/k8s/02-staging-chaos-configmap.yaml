@@ -1,0 +1,93 @@
+---
+# Comprehensive chaos plan for the staging environment.
+# Apply with: kubectl apply -f 02-staging-chaos-configmap.yaml
+# The agent picks up changes within ~5 seconds (watchConfigFile=true polls the mounted file).
+#
+# Scenario rationale:
+#   socket-latency      — simulates upstream DNS / TCP slowness seen in cloud multi-AZ setups
+#   jdbc-reject         — forces application code to exercise JDBC error paths
+#   executor-reject     — validates thread pool back-pressure handling
+#   clock-skew          — surfaces distributed-system bugs dependent on System.currentTimeMillis
+#   fork-join-delay     — stresses parallel stream / CompletableFuture timeout logic
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chaos-plan-staging
+  namespace: staging
+  labels:
+    app: sb3-jdbc-pool-deadlock
+    environment: staging
+  annotations:
+    description: "Comprehensive chaos plan for staging — covers network, JDBC, scheduling, and time faults"
+data:
+  plan.json: |
+    {
+      "version": "1.0",
+      "scenarios": [
+        {
+          "id": "socket-latency-staging",
+          "description": "200ms TCP connect delay on 30% of outbound connections — simulates cloud network jitter",
+          "selector": {
+            "operation": "SOCKET_CONNECT"
+          },
+          "effect": {
+            "type": "DELAY",
+            "delayMs": 200
+          },
+          "probability": 0.30,
+          "enabled": true
+        },
+        {
+          "id": "jdbc-reject-staging",
+          "description": "5% JDBC statement rejection — forces application to exercise SQL exception handling paths",
+          "selector": {
+            "operation": "JDBC_STATEMENT_EXECUTE"
+          },
+          "effect": {
+            "type": "REJECT",
+            "message": "chaos: staging jdbc fault — simulating database unavailability"
+          },
+          "probability": 0.05,
+          "enabled": true
+        },
+        {
+          "id": "executor-reject-staging",
+          "description": "10% executor submit rejection — validates back-pressure and RejectedExecutionException handling",
+          "selector": {
+            "operation": "EXECUTOR_SUBMIT"
+          },
+          "effect": {
+            "type": "REJECT",
+            "message": "chaos: staging executor fault — thread pool at capacity"
+          },
+          "probability": 0.10,
+          "enabled": true
+        },
+        {
+          "id": "clock-skew-staging",
+          "description": "System clock advanced +5 000ms on 1% of calls — surfaces distributed-consensus and token-expiry bugs",
+          "selector": {
+            "operation": "SYSTEM_CLOCK_MILLIS"
+          },
+          "effect": {
+            "type": "CLOCK_SKEW",
+            "skewMs": 5000
+          },
+          "probability": 0.01,
+          "enabled": true
+        },
+        {
+          "id": "fork-join-delay-staging",
+          "description": "50ms task execution delay in ForkJoinPool on 20% of tasks — stresses parallel-stream timeout logic",
+          "selector": {
+            "operation": "FORK_JOIN_TASK_RUN"
+          },
+          "effect": {
+            "type": "DELAY",
+            "delayMs": 50
+          },
+          "probability": 0.20,
+          "enabled": true
+        }
+      ]
+    }

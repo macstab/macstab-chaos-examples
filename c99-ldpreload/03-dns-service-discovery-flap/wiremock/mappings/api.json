@@ -1,0 +1,22 @@
+{
+  "mappings": [
+    {
+      "request": {
+        "method": "GET",
+        "url": "/api/data"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store"
+        },
+        "jsonBody": {
+          "status": "ok",
+          "service": "downstream",
+          "version": "1.0"
+        }
+      }
+    }
+  ]
+}
