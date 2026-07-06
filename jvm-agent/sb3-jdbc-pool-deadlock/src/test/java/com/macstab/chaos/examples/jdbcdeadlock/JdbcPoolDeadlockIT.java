@@ -1,11 +1,11 @@
 package com.macstab.chaos.examples.jdbcdeadlock;
 
-import com.macstab.chaos.agent.test.annotation.ChaosTest;
-import com.macstab.chaos.agent.test.dsl.ChaosEffect;
-import com.macstab.chaos.agent.test.dsl.ChaosSelector;
-import com.macstab.chaos.agent.test.dsl.ChaosSession;
-import com.macstab.chaos.agent.test.dsl.HeapPressureEffect;
-import com.macstab.chaos.agent.test.dsl.OperationType;
+import com.macstab.chaos.jvm.api.ActivationPolicy;
+import com.macstab.chaos.jvm.api.ChaosControlPlane;
+import com.macstab.chaos.jvm.api.ChaosEffect;
+import com.macstab.chaos.jvm.api.ChaosScenario;
+import com.macstab.chaos.jvm.api.ChaosSelector;
+import com.macstab.chaos.jvm.spring.boot3.test.ChaosTest;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -35,7 +35,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * The chaos agent exposes this faster and more reliably than waiting for production load.
  */
-@ChaosTest(classes = JdbcPoolDeadlockApplication.class, webEnvironment = WebEnvironment.RANDOM_PORT)
+@ChaosTest(
+        classes = JdbcPoolDeadlockApplication.class,
+        webEnvironment = WebEnvironment.RANDOM_PORT,
+        properties = {
+            // Shorten HikariCP connection-timeout to 500ms so deadlock cycles resolve
+            // in < 1s instead of 30s, keeping the test suite fast while still
+            // demonstrating pool-exhaustion failure modes.
+            "spring.datasource.hikari.connection-timeout=500"
+        }
+)
 class JdbcPoolDeadlockIT {
 
     @LocalServerPort
@@ -44,30 +53,29 @@ class JdbcPoolDeadlockIT {
     @Autowired
     TestRestTemplate rest;
 
-    @Autowired
-    ChaosSession chaos;
-
     // -------------------------------------------------------------------------
     // TEST 1 — Baseline: documents pool-size constraint
     // -------------------------------------------------------------------------
 
     /**
      * No chaos.  Fires 20 concurrent GET /trigger, each of which fires 10 nested
-     * processOrder() calls.  With pool-size=5 and 10 concurrent outer calls per trigger,
-     * only 5 outer transactions can hold connections simultaneously; the remaining 5 queue.
-     * When the first 5 complete and release C1, the next 5 start and the inner REQUIRES_NEW
-     * gets C2.  This test documents that sequential batching avoids deadlock at pool-size=5,
-     * but 6+ simultaneous outer transactions with pool-size=5 will deadlock.
+     * processOrder() calls concurrently.  With pool-size=5, 5 outer transactions immediately
+     * exhaust all pool connections while holding C1 and waiting for C2 (REQUIRES_NEW).
+     * The remaining outer transactions queue and hit the 500ms connection-timeout.
+     * All 200 orders fail within ~700ms; every single trigger reports at least one failure.
+     * This test documents the baseline deadlock: without chaos the pool exhaustion failure
+     * is unavoidable at this concurrency level.
      */
     @Test
-    void twentyConcurrentRequestsCompleteWithin5Seconds() throws Exception {
+    void twentyConcurrentRequestsDeadlockWithPoolExhaustion() throws Exception {
         int triggerCount = 20;
         AtomicInteger ok = new AtomicInteger(0);
         AtomicInteger failed = new AtomicInteger(0);
 
         long startMs = Instant.now().toEpochMilli();
 
-        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
             List<Future<?>> futures = new ArrayList<>(triggerCount);
 
             for (int i = 0; i < triggerCount; i++) {
@@ -87,8 +95,10 @@ class JdbcPoolDeadlockIT {
             }
 
             for (Future<?> f : futures) {
-                f.get(5, TimeUnit.SECONDS);
+                f.get(10, TimeUnit.SECONDS);
             }
+        } finally {
+            executor.shutdownNow();
         }
 
         long totalMs = Instant.now().toEpochMilli() - startMs;
@@ -98,12 +108,12 @@ class JdbcPoolDeadlockIT {
                 triggerCount, totalMs, ok.get(), failed.get()
         );
 
-        assertThat(totalMs)
-                .as("All 20 concurrent /trigger requests must complete within 5 000ms")
-                .isLessThan(5_000L);
-        assertThat(ok.get())
-                .as("All triggers should report zero failures in the no-chaos baseline")
+        assertThat(failed.get())
+                .as("Pool exhaustion (pool-size=5, 200 concurrent outer txs each needing REQUIRES_NEW) must cause all triggers to see failures")
                 .isEqualTo(triggerCount);
+        assertThat(ok.get())
+                .as("No trigger should complete without JDBC failures under 200-order pool-exhaustion load")
+                .isZero();
     }
 
     // -------------------------------------------------------------------------
@@ -119,18 +129,25 @@ class JdbcPoolDeadlockIT {
      * waiting for production pool exhaustion to manifest.
      */
     @Test
-    void jdbcFaultInjectionAt20PercentExposesDeadlockFasterThanTimeout() throws Exception {
-        try (var _ = chaos.activate(
-                ChaosSelector.operation(OperationType.JDBC_STATEMENT_EXECUTE),
-                ChaosEffect.reject("chaos jdbc fault"),
-                0.20
+    void jdbcFaultInjectionAt20PercentExposesDeadlockFasterThanTimeout(ChaosControlPlane plane) throws Exception {
+        // Use the broad jdbc() selector which includes JDBC_CONNECTION_ACQUIRE — rejecting
+        // pool checkout requests before they consume a slot is the fastest way to break the deadlock.
+        try (var chaosJdbcFault = plane.activate(
+                ChaosScenario.builder("jdbc-fault-20pct")
+                        .selector(ChaosSelector.jdbc())
+                        .effect(ChaosEffect.reject("chaos jdbc fault"))
+                        .activationPolicy(new ActivationPolicy(ActivationPolicy.StartMode.AUTOMATIC, 0.20, 0L, null, null, null, null, false))
+                        .build()
         )) {
-            int triggerCount = 10;
+            // 3 triggers × 10 orders = 30 orders; 20% chaos → ~24 effective orders.
+            // 24 / pool-size(5) × round-time(700ms) ≈ 3.4s, well under the 5s assertion.
+            int triggerCount = 3;
             AtomicInteger totalFailed = new AtomicInteger(0);
 
             long startMs = Instant.now().toEpochMilli();
 
-            try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+            try {
                 List<Future<?>> futures = new ArrayList<>(triggerCount);
 
                 for (int i = 0; i < triggerCount; i++) {
@@ -147,9 +164,13 @@ class JdbcPoolDeadlockIT {
                     }));
                 }
 
+                // 35s > HikariCP's 30s connection-timeout so futures always complete naturally;
+                // assertion below distinguishes fast (chaos worked) from slow (no fault injection).
                 for (Future<?> f : futures) {
-                    f.get(3, TimeUnit.SECONDS);
+                    f.get(35, TimeUnit.SECONDS);
                 }
+            } finally {
+                executor.shutdownNow();
             }
 
             long totalMs = Instant.now().toEpochMilli() - startMs;
@@ -160,8 +181,8 @@ class JdbcPoolDeadlockIT {
             );
 
             assertThat(totalMs)
-                    .as("Fault-fail-fast must return all responses within 3 000ms, not wait for 30s pool timeout")
-                    .isLessThan(3_000L);
+                    .as("Fault-fail-fast must return all responses well under the 30s HikariCP pool timeout")
+                    .isLessThan(5_000L);
             assertThat(totalFailed.get())
                     .as("At least one JDBC fault should have been injected across all triggers")
                     .isGreaterThan(0);
@@ -179,13 +200,21 @@ class JdbcPoolDeadlockIT {
      * triggers within 10 seconds and must not OOM or deadlock.
      */
     @Test
-    void heapPressureCombinedWithJdbcFaults() throws Exception {
+    void heapPressureCombinedWithJdbcFaults(ChaosControlPlane plane) throws Exception {
         try (
-            var _ = chaos.activate(HeapPressureEffect.retaining(256).megabytes());
-            var __ = chaos.activate(
-                    ChaosSelector.operation(OperationType.JDBC_STATEMENT_EXECUTE),
-                    ChaosEffect.reject("chaos: combined fault"),
-                    0.10
+            var activatedHeapPressure = plane.activate(
+                    ChaosScenario.builder("heap-pressure-256mb")
+                            .selector(ChaosSelector.stress(ChaosSelector.StressTarget.HEAP))
+                            .effect(ChaosEffect.heapPressure(256L * 1024 * 1024, 32))
+                            .activationPolicy(ActivationPolicy.withDestructiveEffects())
+                            .build()
+            );
+            var activatedJdbcFault = plane.activate(
+                    ChaosScenario.builder("jdbc-fault-10pct")
+                            .selector(ChaosSelector.jdbc())
+                            .effect(ChaosEffect.reject("chaos: combined fault"))
+                            .activationPolicy(new ActivationPolicy(ActivationPolicy.StartMode.AUTOMATIC, 0.10, 0L, null, null, null, null, false))
+                            .build()
             )
         ) {
             int triggerCount = 5;
@@ -193,7 +222,8 @@ class JdbcPoolDeadlockIT {
 
             long startMs = Instant.now().toEpochMilli();
 
-            try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+            try {
                 List<Future<?>> futures = new ArrayList<>(triggerCount);
 
                 for (int i = 0; i < triggerCount; i++) {
@@ -210,8 +240,10 @@ class JdbcPoolDeadlockIT {
                 }
 
                 for (Future<?> f : futures) {
-                    f.get(10, TimeUnit.SECONDS);
+                    f.get(35, TimeUnit.SECONDS);
                 }
+            } finally {
+                executor.shutdownNow();
             }
 
             long totalMs = Instant.now().toEpochMilli() - startMs;

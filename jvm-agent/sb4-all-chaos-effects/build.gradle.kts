@@ -23,7 +23,7 @@ dependencies {
 
     runtimeOnly("com.h2database:h2")
 
-    testImplementation("com.macstab:chaos-agent-spring-boot4-test-starter:1.0.0")
+    testImplementation("com.macstab.chaos.jvm:chaos-agent-spring-boot4-test-starter:1.0.0")
     testImplementation("org.springframework.boot:spring-boot-starter-test") {
         exclude(group = "org.junit.vintage", module = "junit-vintage-engine")
     }
