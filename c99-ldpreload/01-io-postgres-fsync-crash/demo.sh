@@ -20,7 +20,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 CONF_CONTAINER="chaos-probe"
-CONF_PATH="/chaos/.chaos-io.conf"
+# chaos-conf volume is mounted at /tmp in chaos-probe, postgres and app —
+# postgres reads /tmp/.chaos-io.conf, so the config MUST live there.
+CONF_PATH="/tmp/.chaos-io.conf"
 
 # ANSI colours
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'

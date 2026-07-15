@@ -14,14 +14,8 @@ java {
 }
 
 repositories {
-    maven {
-        name = "GitHubPackages"
-        url = uri("https://maven.pkg.github.com/macstab/chaos-testing-java-agent")
-        credentials {
-            username = System.getenv("GITHUB_ACTOR") ?: ""
-            password = System.getenv("GITHUB_TOKEN") ?: ""
-        }
-    }
+    // chaos-agent-spring-boot3-test-starter:1.0.0 is published to Maven Central —
+    // a fresh clone resolves with no credentials, no mavenLocal, no GitHub token.
     mavenCentral()
 }
 

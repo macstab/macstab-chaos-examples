@@ -145,11 +145,14 @@ class JdbcPoolDeadlockIT {
     void jdbcFaultInjectionAt20PercentExposesDeadlockFasterThanTimeout(ChaosControlPlane plane) throws Exception {
         // Use the broad jdbc() selector which includes JDBC_CONNECTION_ACQUIRE — rejecting
         // pool checkout requests before they consume a slot is the fastest way to break the deadlock.
+        // randomSeed=42L (7th arg) fixes the PRNG: the injection decisions for a given
+        // ordered sequence of matched JDBC calls are reproducible across runs, so a CI
+        // failure reproduces locally with one command.
         try (var chaosJdbcFault = plane.activate(
                 ChaosScenario.builder("jdbc-fault-20pct")
                         .selector(ChaosSelector.jdbc())
                         .effect(ChaosEffect.reject("chaos jdbc fault"))
-                        .activationPolicy(new ActivationPolicy(ActivationPolicy.StartMode.AUTOMATIC, 0.20, 0L, null, null, null, null, false))
+                        .activationPolicy(new ActivationPolicy(ActivationPolicy.StartMode.AUTOMATIC, 0.20, 0L, null, null, null, 42L, false))
                         .build()
         )) {
             // 3 triggers × 10 orders = 30 orders; 20% chaos → ~24 effective orders.
