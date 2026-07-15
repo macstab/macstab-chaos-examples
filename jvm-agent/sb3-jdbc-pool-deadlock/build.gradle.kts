@@ -14,7 +14,14 @@ java {
 }
 
 repositories {
-    mavenLocal()
+    maven {
+        name = "GitHubPackages"
+        url = uri("https://maven.pkg.github.com/macstab/chaos-testing-java-agent")
+        credentials {
+            username = System.getenv("GITHUB_ACTOR") ?: ""
+            password = System.getenv("GITHUB_TOKEN") ?: ""
+        }
+    }
     mavenCentral()
 }
 
@@ -25,7 +32,7 @@ dependencies {
 
     runtimeOnly("com.h2database:h2")
 
-    testImplementation("com.macstab.chaos.jvm:chaos-agent-spring-boot3-test-starter:0.1.0-SNAPSHOT")
+    testImplementation("com.macstab.chaos.jvm:chaos-agent-spring-boot3-test-starter:1.0.0")
     testImplementation("org.springframework.boot:spring-boot-starter-test") {
         exclude(group = "org.junit.vintage", module = "junit-vintage-engine")
     }

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, "feat/**"]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel a running job if a newer commit arrives for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - sb3-jdbc-pool-deadlock
+          - sb4-all-chaos-effects
+          - sb4-all-selectors
+          - sb4-all-stressors
+          - sb4-things-nobody-else-can-test
+
+    runs-on: ubuntu-latest
+    name: ${{ matrix.module }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      # setup-gradle provides the Gradle 9.3 binary for sb4-* modules that have
+      # no local gradlew; for sb3 it is a no-op because the local wrapper takes
+      # precedence when running ./gradlew.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.0'
+
+      - name: Test
+        working-directory: jvm-agent/${{ matrix.module }}
+        run: |
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            ./gradlew test --no-daemon --stacktrace
+          else
+            gradle test --no-daemon --stacktrace
+          fi
+        env:
+          # Passed to build.gradle.kts for GitHub Packages auth (sb3-jdbc-pool-deadlock).
+          # GITHUB_TOKEN is automatically provisioned by Actions — no secret needed.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.module }}
+          path: jvm-agent/${{ matrix.module }}/build/test-results/**/*.xml
+          if-no-files-found: ignore
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ matrix.module }}
+          path: jvm-agent/${{ matrix.module }}/build/reports/tests/
+          if-no-files-found: ignore

@@ -113,14 +113,14 @@ run_inserts "baseline" 20
 info "Baseline: ok=${PHASE_OK[baseline]}  fail=${PHASE_FAIL[baseline]}"
 
 banner "STEP 5 — Enable 10 % EIO on writes (NO restart)"
-write_conf "/var/lib/postgresql/data:write:ERRNO:EIO:0.1"
+write_conf "/var/lib/postgresql/data:write:EIO:0.1"
 sleep 1   # library re-reads config within one mmap page-fault cycle
 run_inserts "10pct" 20
 info "10% phase: ok=${PHASE_OK[10pct]}  fail=${PHASE_FAIL[10pct]}"
 
 banner "STEP 6 — Hot-reload to 40 % EIO — NO container restart"
 warn "Changing probability from 0.1 → 0.4 via file write only"
-write_conf "/var/lib/postgresql/data:write:ERRNO:EIO:0.4"
+write_conf "/var/lib/postgresql/data:write:EIO:0.4"
 sleep 1
 run_inserts "40pct" 20
 info "40% phase: ok=${PHASE_OK[40pct]}  fail=${PHASE_FAIL[40pct]}"

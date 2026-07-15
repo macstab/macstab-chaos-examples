@@ -12,6 +12,8 @@ import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -93,6 +95,17 @@ class JdbcPoolDeadlockIT {
                     }
                 }));
             }
+
+            // Outer txs acquire C1, sleep 200ms, then race to acquire C2 (REQUIRES_NEW).
+            // Pool exhaustion is fully formed within ~200ms of requests arriving.
+            // Call the JVM deadlock detector during this window — it cannot see LockSupport.park().
+            Thread.sleep(300);
+            ThreadMXBean tmx = ManagementFactory.getThreadMXBean();
+            assertThat(tmx.findDeadlockedThreads())
+                    .as("ThreadMXBean.findDeadlockedThreads() returns null: HikariCP's ConcurrentBag.borrow() "
+                        + "parks via LockSupport.parkNanos() which registers no LockInfo — "
+                        + "the JVM lock graph is blind to this deadlock")
+                    .isNull();
 
             for (Future<?> f : futures) {
                 f.get(10, TimeUnit.SECONDS);
